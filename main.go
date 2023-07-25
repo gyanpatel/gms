@@ -1,11 +1,6 @@
 package main
 
 /////////////////////////////////////////////////////////////////////////
-//      (c) 2023 Fujitsu Services, POA Account                         //
-//       By: GyanPatel                                                 //
-//       Ref:https://jira.apt.fs.fujitsu.com/jira/browse/EMIS-321      //
-//       Date: 23-June-2023                                            //
-//       Execution command:DXCTOTEMMIG.exe -env=/path/of/config/file   //
 // Change History                                                      //
 // Version    Author    Date           Desc                            //
 // 1          Gyan      23-June-2023    Initial version                //
@@ -17,8 +12,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/jackc/pgx/v5"
-	_ "github.com/microsoft/go-mssqldb"
 	"log"
 	"os"
 	"os/exec"
@@ -26,17 +19,21 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
+	_ "github.com/microsoft/go-mssqldb"
 )
 
 // Postgres DB Connection details
-var srcConDet ConDeteail
-var tgtConDet ConDeteail
-var dbConPg *pgx.Conn
-var dbConMss *sql.DB
-var (
-	dbConnectString string
-	connString      string
-)
+
+type DbConnMaster struct {
+	DbConPg              *pgx.Conn
+	DbConMss             *sql.DB
+	DbConOra             *sql.DB
+	SrcConStr, TgtConStr string
+}
+
+var dbConnMaster DbConnMaster
 
 type ConDeteail struct {
 	Db     string `json:"db"`
@@ -49,6 +46,8 @@ type ConDeteail struct {
 }
 
 func init() {
+	var srcConDet ConDeteail
+	var tgtConDet ConDeteail
 	srcDb, err := os.ReadFile("sourcedb.json")
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected to read config file ", err)
@@ -65,35 +64,15 @@ func init() {
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected to unmarshal config file ", err)
 	}
-	dbConnectString = "dbname=" + srcConDet.DBName + " port=" + srcConDet.DBPort + " user=" + srcConDet.DBUser + " password=" + srcConDet.Pass + " host=" + srcConDet.Host + " sslmode=" + srcConDet.SSL
-	config, err := pgx.ParseConfig(dbConnectString)
-	if strings.Compare(srcConDet.SSL, "disable") != 0 {
-		config.TLSConfig.MinVersion = 1
+	dbConnMaster.DbConPg, dbConnMaster.SrcConStr, err = srcConDet.getPgDbConn()
+	if err != nil {
+		log.Fatalln(GetCurrentFuncName(), "error connecting to PG DB  ", err)
 	}
 
+	dbConnMaster.DbConMss, dbConnMaster.TgtConStr, err = tgtConDet.getMSSConn()
 	if err != nil {
-		log.Fatalln(GetCurrentFuncName(), "Unable to parse: ", err)
+		log.Fatalln(GetCurrentFuncName(), "error connecting to PG DB  ", err)
 	}
-	conn, err := pgx.ConnectConfig(context.Background(), config)
-	if err != nil {
-		log.Fatalln(GetCurrentFuncName(), "Unable to connect to PG database: ", err)
-	}
-	err = conn.Ping(context.Background())
-	if err != nil {
-		log.Fatalln(GetCurrentFuncName(), "Unable to ping PG database:", err)
-	}
-	dbConPg = conn
-	// below commented line for reference only
-	connString = fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s;database=%s;", tgtConDet.Host, tgtConDet.DBUser, tgtConDet.Pass, tgtConDet.DBPort, tgtConDet.DBName)
-	connms, err := sql.Open(tgtConDet.Db, connString)
-	if err != nil {
-		log.Fatalln(GetCurrentFuncName(), "Unable to connect to database:", err, connString)
-	}
-	err = connms.Ping()
-	if err != nil {
-		log.Fatalln(GetCurrentFuncName(), "Unable to connect to MS database:", err, connString)
-	}
-	dbConMss = connms
 }
 
 type TableMetaData struct {
@@ -104,6 +83,7 @@ type TableMetaData struct {
 var (
 	tgtMetaData []TableMetaData
 	srcMetaData []TableMetaData
+	ctx         = context.Background()
 )
 
 func main() {
@@ -141,26 +121,12 @@ func main() {
 		}
 	}
 	log.Println(GetCurrentFuncName(), "process completed successfully.")
-	defer dbConPg.Close(context.Background())
-	defer dbConMss.Close()
+	defer dbConnMaster.DbConPg.Close(ctx)
+	defer dbConnMaster.DbConMss.Close()
 }
 func (meta *MetadataMaster) PGtoMSSMig() (err error) {
 	log.Println(GetCurrentFuncName(), "retrieving source metadata ")
-	srcrows, err := dbConPg.Query(context.Background(), fmt.Sprintf(`SELECT
-                                                            a.attname as "Column",
-                                                            pg_catalog.format_type(a.atttypid, a.atttypmod) as "Datatype"
-                                                        FROM
-                                                            pg_catalog.pg_attribute a
-                                                        WHERE
-                                                            a.attnum > 0
-                                                            AND NOT a.attisdropped
-                                                            AND a.attrelid = (
-                                                                SELECT c.oid
-                                                                FROM pg_catalog.pg_class c
-                                                                    LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                                                                WHERE c.relname ~ '^(%s)$'
-                                                                    AND pg_catalog.pg_table_is_visible(c.oid) 
-                                                            ) order by 1`, meta.LowerSrctable))
+	srcrows, err := dbConnMaster.DbConPg.Query(ctx, fmt.Sprintf(PGDefnSQL, meta.LowerSrctable))
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected error for Query:", err)
 	}
@@ -174,16 +140,8 @@ func (meta *MetadataMaster) PGtoMSSMig() (err error) {
 
 		srcMetaData = append(srcMetaData, metadata)
 	}
-	log.Println(GetCurrentFuncName(), "retrieving target metadata ")
-	tgtrows, err := dbConMss.Query(fmt.Sprintf(`select  col.name as column_name,
-                                                                             t.name as data_type 
-                                                                      from sys.tables as tab
-                                                                             inner join sys.columns as col
-                                                                                    on tab.object_id = col.object_id
-                                                                             left join sys.types as t
-                                                                             on col.user_type_id = t.user_type_id
-                                                                             where tab.name = '%s'
-                                                                             order by column_name`, meta.Tgtab))
+	log.Println(GetCurrentFuncName(), "retrieving target metadata ", MSSDefnSQL, meta.Tgtab)
+	tgtrows, err := dbConnMaster.DbConMss.Query(MSSDefnSQL, meta.Tgtab)
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected error for Query:", err)
 	}
@@ -215,15 +173,15 @@ func (meta *MetadataMaster) CreateGoFile() (err error) {
 		log.Fatalln(GetCurrentFuncName(), "error reading the template ", err)
 	}
 	migFileCont := strings.Replace(string(template), "COLLUMMETADATA_TYPESTRUCT", crType, -1)
-	migFileCont = strings.Replace(migFileCont, "PGDBCONNSTR", dbConnectString, -1)
-	migFileCont = strings.Replace(migFileCont, "MSSDBCONNSTR", connString, -1)
+	migFileCont = strings.Replace(migFileCont, "PGDBCONNSTR", dbConnMaster.SrcConStr, -1)
+	migFileCont = strings.Replace(migFileCont, "MSSDBCONNSTR", dbConnMaster.TgtConStr, -1)
 	sourceSelectQuery := fmt.Sprintf("select %s from %s.%s", selectQuery, meta.Srcsc, meta.Srctab)
 	migFileCont = strings.Replace(migFileCont, "SOURCESELECTQUERY", sourceSelectQuery, -1)
 	migFileCont = strings.Replace(migFileCont, "SOURCESLICEDEF", fmt.Sprintf("var %s []%s", meta.LowerSrctable, meta.Srctab), -1)
 	migFileCont = strings.Replace(migFileCont, "SOURCEROWDEF", fmt.Sprintf("var rec%s %s", meta.LowerSrctable, meta.Srctab), -1)
 	migFileCont = strings.Replace(migFileCont, "SORCEROWAPPENDDEF", fmt.Sprintf("%s = append( %s, rec%s)", meta.LowerSrctable, meta.LowerSrctable, meta.LowerSrctable), -1)
 	migFileCont = strings.Replace(migFileCont, "SORCESCANDEF", srcScanDef, -1)
-	migFileCont = strings.Replace(migFileCont, "TARGETTABLENAME", meta.Tgtsc+"."+meta.Tgtab, -1)
+	migFileCont = strings.Replace(migFileCont, "TARGETTABLENAME", meta.Tgtab, -1)
 	migFileCont = strings.Replace(migFileCont, "TARGETCOLUMNLIST", tgtColList, -1)
 	migFileCont = strings.Replace(migFileCont, "TARGETSLICEDATA", meta.LowerSrctable, -1)
 	migFileCont = strings.Replace(migFileCont, "TARGETSCAN", tgtScanList, -1)
@@ -246,8 +204,8 @@ func (meta *MetadataMaster) CreateGoFile() (err error) {
 }
 
 type MetadataMaster struct {
-	Srctab, Tgtab, Srcsc, Tgtsc, LowerSrctable, MigCode string
-	SrcMetaData, TgtMetaData                            []TableMetaData
+	Srctab, Tgtab, Srcsc, Tgtsc, LowerSrctable, MigCode, SrcConStr, TgtConStr string
+	SrcMetaData, TgtMetaData                                                  []TableMetaData
 }
 
 func (meta *MetadataMaster) CreateType() (structType, selectQuery, srcScanDef, tgtColList, tgtScanList string, err error) {
@@ -304,21 +262,7 @@ func GetCurrentFuncName() string {
 
 func (meta *MetadataMaster) PGtoORAMig() (err error) {
 	log.Println(GetCurrentFuncName(), "retrieving source metadata ")
-	srcrows, err := dbConPg.Query(context.Background(), fmt.Sprintf(`SELECT
-                                                            a.attname as "Column",
-                                                            pg_catalog.format_type(a.atttypid, a.atttypmod) as "Datatype"
-                                                        FROM
-                                                            pg_catalog.pg_attribute a
-                                                        WHERE
-                                                            a.attnum > 0
-                                                            AND NOT a.attisdropped
-                                                            AND a.attrelid = (
-                                                                SELECT c.oid
-                                                                FROM pg_catalog.pg_class c
-                                                                    LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                                                                WHERE c.relname ~ '^(%s)$'
-                                                                    AND pg_catalog.pg_table_is_visible(c.oid) 
-                                                            ) order by 1`, meta.LowerSrctable))
+	srcrows, err := dbConnMaster.DbConPg.Query(context.Background(), fmt.Sprintf(PGDefnSQL, meta.LowerSrctable))
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected error for Query:", err)
 	}
@@ -333,15 +277,7 @@ func (meta *MetadataMaster) PGtoORAMig() (err error) {
 		srcMetaData = append(srcMetaData, metadata)
 	}
 	log.Println(GetCurrentFuncName(), "retrieving target metadata ")
-	tgtrows, err := dbConMss.Query(fmt.Sprintf(`select  col.name as column_name,
-                                                                             t.name as data_type 
-                                                                      from sys.tables as tab
-                                                                             inner join sys.columns as col
-                                                                                    on tab.object_id = col.object_id
-                                                                             left join sys.types as t
-                                                                             on col.user_type_id = t.user_type_id
-                                                                             where tab.name = '%s'
-                                                                             order by column_name`, meta.Tgtab))
+	tgtrows, err := dbConnMaster.DbConMss.Query(fmt.Sprintf(ORADefnSQL, meta.Tgtab))
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected error for Query:", err)
 	}
@@ -362,6 +298,40 @@ func (meta *MetadataMaster) PGtoORAMig() (err error) {
 	err = meta.CreateGoFile()
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), GetCurrentFuncName(), "unexpected error calling CreateGoFile", err)
+	}
+	return
+}
+
+func (conDeteail *ConDeteail) getPgDbConn() (conn *pgx.Conn, dbConstrPg string, err error) {
+	dbConstrPg = "dbname=" + conDeteail.DBName + " port=" + conDeteail.DBPort + " user=" + conDeteail.DBUser + " password=" + conDeteail.Pass + " host=" + conDeteail.Host + " sslmode=" + conDeteail.SSL
+	config, err := pgx.ParseConfig(dbConstrPg)
+	if strings.Compare(conDeteail.SSL, "disable") != 0 {
+		config.TLSConfig.MinVersion = 1
+	}
+
+	if err != nil {
+		log.Println(GetCurrentFuncName(), "Unable to parse: ", err)
+	}
+	conn, err = pgx.ConnectConfig(context.Background(), config)
+	if err != nil {
+		log.Println(GetCurrentFuncName(), "Unable to connect to PG database: ", err)
+	}
+	err = conn.Ping(context.Background())
+	if err != nil {
+		log.Println(GetCurrentFuncName(), "Unable to ping PG database:", err)
+	}
+	return
+}
+
+func (conDeteail *ConDeteail) getMSSConn() (conn *sql.DB, dbConstrMss string, err error) {
+	dbConstrMss = fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s;database=%s;", conDeteail.Host, conDeteail.DBUser, conDeteail.Pass, conDeteail.DBPort, conDeteail.DBName)
+	conn, err = sql.Open(conDeteail.Db, dbConstrMss)
+	if err != nil {
+		log.Println(GetCurrentFuncName(), "Unable to connect to database:", err)
+	}
+	err = conn.Ping()
+	if err != nil {
+		log.Println(GetCurrentFuncName(), "Unable to connect to MS database:", err)
 	}
 	return
 }
