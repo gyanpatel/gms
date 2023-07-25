@@ -1,0 +1,9 @@
+{
+    "db": "postgres",
+    "host":"10.185.246.85",
+    "dbuser": "postgres",
+    "dbport": "5432",
+    "pass": "brdb",
+    "dbname": "postgres",
+    "sslmode":"disable" 
+}

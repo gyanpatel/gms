@@ -1,0 +1,9 @@
+{
+    "db": "mssql",
+    "host":"10.185.244.91",
+    "dbuser": "sa",
+    "dbport": "1433",
+    "pass": "Br1dgeV1ew",
+    "dbname": "mta",
+    "sslmode":"require"
+}
