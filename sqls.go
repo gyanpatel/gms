@@ -22,7 +22,7 @@ AND a.attrelid = (
 	SELECT c.oid
 	FROM pg_catalog.pg_class c
 		LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-	WHERE c.relname ~ '^(%s)$'
+	WHERE c.relname = $1
 		AND pg_catalog.pg_table_is_visible(c.oid) 
 ) order by 1`
-var ORADefnSQL string = `select COLUMN_NAME,DATA_TYPE from all_tab_columns WHERE owner = :1 AND TABLE_NAME =  :2`
+var ORADefnSQL string = `select COLUMN_NAME,DATA_TYPE from all_tab_columns WHERE owner = :1 AND TABLE_NAME =  :2 order by 1`

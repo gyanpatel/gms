@@ -24,7 +24,9 @@ import (
 // Postgres DB Connection details
 var (
 	dbConPg  *pgx.Conn
-	dbConOra *sql.DB
+	dbConOra *go_ora.Connection
+	ctx         = context.Background()
+
 )
 
 
@@ -48,20 +50,20 @@ func init() {
 	}
 	dbConPg = conn
 	// below commented line for reference only
-	connString := go_ora.BuildUrl(ORADBCONNSTR, nil)
 
-	conn, err := go_ora.NewConnection(connString)
+	connora, err := go_ora.NewConnection("ORADBCONNSTR")
 	if err != nil {
 		log.Fatalf("Err conn: %v", err)
 	}
-	err = conn.Open()
+	err = connora.Open()
 	if err != nil {
 		log.Fatalf("Err open: %v", err)
 	}
-	defer func() {
-		_ = conn.Close()
-	}()
-	dbConMss = connms
+	err = connora.Ping(ctx)
+	if err != nil {
+		log.Fatalf("Err conn: %v", err)
+	}
+	dbConOra = connora
 }
 
 
@@ -88,32 +90,15 @@ func main() {
 	if rows.Err() != nil {
 		log.Fatalln( "Unexpected error for rows.Err():", rows.Err())
 	}
-	log.Println("begin sql server transaction ")
-	// copy data to mssql table
-	txn, err := dbConMss.Begin()
-	if err != nil {
-		log.Fatalln( "unable to being ms tranasaction ", err)
-	}
-	log.Println("prepare insert ")
-	stmt, err := txn.Prepare(mssql.CopyIn("TARGETTABLENAME", mssql.BulkOptions{FireTriggers: false}, TARGETCOLUMNLIST))
-	if err != nil {
-		log.Fatalln( "unable to prepare stmt ", err)
-	}
-	log.Println("start data insert ")
-	for _, rec := range TARGETSLICEDATA {
-		_, err = stmt.Exec(TARGETSCAN)
-		if err != nil {
-			log.Fatalln( "unable to exec insert ", err)
-		}
-	}
+	
 	//////////////////////
-	bulk := go_ora.NewBulkCopy(conn, "TARGETTABLENAME")
+	bulk := go_ora.NewBulkCopy(dbConOra, "TARGETTABLENAME")
 	bulk.ColumnNames = []string{TARGETCOLUMNLIST}
-	err := bulk.StartStream()
+	err = bulk.StartStream()
 	if err != nil {
 		log.Fatalln(err)
 	}
-	for _,rec := TARGETSLICEDATA  {
+	for _,rec := range TARGETSLICEDATA  {
 		err = bulk.AddRow(TARGETSCAN)
 		if err != nil {
 			_ = bulk.Abort()

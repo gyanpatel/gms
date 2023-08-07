@@ -1,5 +1,5 @@
 {
-    "db": "postgres",
+    "db": "pg",
     "host":"10.185.246.85",
     "dbuser": "postgres",
     "dbport": "5432",

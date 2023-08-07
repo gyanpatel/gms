@@ -22,6 +22,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	_ "github.com/microsoft/go-mssqldb"
+	go_ora "github.com/sijms/go-ora/v2"
 )
 
 // Postgres DB Connection details
@@ -64,15 +65,26 @@ func init() {
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected to unmarshal config file ", err)
 	}
-	dbConnMaster.DbConPg, dbConnMaster.SrcConStr, err = srcConDet.getPgDbConn()
-	if err != nil {
-		log.Fatalln(GetCurrentFuncName(), "error connecting to PG DB  ", err)
+	if strings.Contains(tgtConDet.Db, "pg") || strings.Contains(srcConDet.Db, "pg") {
+
+		dbConnMaster.DbConPg, dbConnMaster.SrcConStr, err = srcConDet.getPgDbConn()
+		if err != nil {
+			log.Fatalln(GetCurrentFuncName(), "error connecting to PG DB  ", err)
+		}
+	}
+	if strings.Contains(tgtConDet.Db, "mssql") || strings.Contains(srcConDet.Db, "mssql") {
+		dbConnMaster.DbConMss, dbConnMaster.TgtConStr, err = tgtConDet.getMSSConn()
+		if err != nil {
+			log.Fatalln(GetCurrentFuncName(), "error connecting to MS DB  ", err)
+		}
+	}
+	if strings.Contains(tgtConDet.Db, "ora") || strings.Contains(srcConDet.Db, "ora") {
+		dbConnMaster.DbConOra, dbConnMaster.TgtConStr, err = tgtConDet.getORAConn()
+		if err != nil {
+			log.Fatalln(GetCurrentFuncName(), "error connecting to ORA DB  ", err)
+		}
 	}
 
-	dbConnMaster.DbConMss, dbConnMaster.TgtConStr, err = tgtConDet.getMSSConn()
-	if err != nil {
-		log.Fatalln(GetCurrentFuncName(), "error connecting to PG DB  ", err)
-	}
 }
 
 type TableMetaData struct {
@@ -113,20 +125,23 @@ func main() {
 		if err != nil {
 			log.Fatalln(GetCurrentFuncName(), "migration error ", migcode, err)
 		}
+		defer dbConnMaster.DbConPg.Close(ctx)
+		defer dbConnMaster.DbConMss.Close()
+
 	}
 	if strings.Compare(migcode, "pg_ora") == 0 {
 		err := meta.PGtoORAMig()
 		if err != nil {
 			log.Fatalln(GetCurrentFuncName(), "migration error ", migcode, err)
 		}
+		defer dbConnMaster.DbConPg.Close(ctx)
+		defer dbConnMaster.DbConOra.Close()
 	}
 	log.Println(GetCurrentFuncName(), "process completed successfully.")
-	defer dbConnMaster.DbConPg.Close(ctx)
-	defer dbConnMaster.DbConMss.Close()
 }
 func (meta *MetadataMaster) PGtoMSSMig() (err error) {
 	log.Println(GetCurrentFuncName(), "retrieving source metadata ")
-	srcrows, err := dbConnMaster.DbConPg.Query(ctx, fmt.Sprintf(PGDefnSQL, meta.LowerSrctable))
+	srcrows, err := dbConnMaster.DbConPg.Query(ctx, PGDefnSQL, meta.LowerSrctable)
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected error for Query:", err)
 	}
@@ -185,6 +200,8 @@ func (meta *MetadataMaster) CreateGoFile() (err error) {
 	migFileCont = strings.Replace(migFileCont, "TARGETCOLUMNLIST", tgtColList, -1)
 	migFileCont = strings.Replace(migFileCont, "TARGETSLICEDATA", meta.LowerSrctable, -1)
 	migFileCont = strings.Replace(migFileCont, "TARGETSCAN", tgtScanList, -1)
+	migFileCont = strings.Replace(migFileCont, "ORADBCONNSTR", dbConnMaster.TgtConStr, -1)
+
 	dir := "migration/pgtomssmig/" + meta.Srctab
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		err := os.MkdirAll(dir, 0644)
@@ -214,6 +231,7 @@ func (meta *MetadataMaster) CreateType() (structType, selectQuery, srcScanDef, t
 		tgtColList = tgtColList + fmt.Sprintf(`"%s",`, rec.ColumnName)
 
 	}
+	log.Println(tgtColList)
 	for _, rec := range meta.SrcMetaData {
 		var dType string
 		selectQuery = selectQuery + rec.ColumnName + ","
@@ -262,7 +280,7 @@ func GetCurrentFuncName() string {
 
 func (meta *MetadataMaster) PGtoORAMig() (err error) {
 	log.Println(GetCurrentFuncName(), "retrieving source metadata ")
-	srcrows, err := dbConnMaster.DbConPg.Query(context.Background(), fmt.Sprintf(PGDefnSQL, meta.LowerSrctable))
+	srcrows, err := dbConnMaster.DbConPg.Query(context.Background(), PGDefnSQL, meta.LowerSrctable)
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected error for Query:", err)
 	}
@@ -277,7 +295,7 @@ func (meta *MetadataMaster) PGtoORAMig() (err error) {
 		srcMetaData = append(srcMetaData, metadata)
 	}
 	log.Println(GetCurrentFuncName(), "retrieving target metadata ")
-	tgtrows, err := dbConnMaster.DbConMss.Query(fmt.Sprintf(ORADefnSQL, meta.Tgtab))
+	tgtrows, err := dbConnMaster.DbConOra.Query(ORADefnSQL, "OPS$BRDB", strings.ToUpper(meta.Tgtab))
 	if err != nil {
 		log.Fatalln(GetCurrentFuncName(), "unexpected error for Query:", err)
 	}
@@ -326,6 +344,21 @@ func (conDeteail *ConDeteail) getPgDbConn() (conn *pgx.Conn, dbConstrPg string, 
 func (conDeteail *ConDeteail) getMSSConn() (conn *sql.DB, dbConstrMss string, err error) {
 	dbConstrMss = fmt.Sprintf("server=%s;user id=%s;password=%s;port=%s;database=%s;", conDeteail.Host, conDeteail.DBUser, conDeteail.Pass, conDeteail.DBPort, conDeteail.DBName)
 	conn, err = sql.Open(conDeteail.Db, dbConstrMss)
+	if err != nil {
+		log.Println(GetCurrentFuncName(), "Unable to connect to database:", err)
+	}
+	err = conn.Ping()
+	if err != nil {
+		log.Println(GetCurrentFuncName(), "Unable to connect to MS database:", err)
+	}
+	return
+}
+func (conDeteail *ConDeteail) getORAConn() (conn *sql.DB, dbConstrOra string, err error) {
+	dbConstrOra = go_ora.BuildUrl(conDeteail.Host, 1529, conDeteail.DBName, conDeteail.DBUser, conDeteail.Pass, nil)
+	log.Println(dbConstrOra)
+	//apoptmpDB, err := sql.Open("oracle", apopdbConnectString)
+
+	conn, err = sql.Open("oracle", dbConstrOra)
 	if err != nil {
 		log.Println(GetCurrentFuncName(), "Unable to connect to database:", err)
 	}

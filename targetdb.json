@@ -1,9 +1,9 @@
 {
-    "db": "mssql",
-    "host":"10.185.244.91",
-    "dbuser": "sa",
-    "dbport": "1433",
-    "pass": "Br1dgeV1ew",
-    "dbname": "mta",
+    "db": "oracle",
+    "host":"10.185.246.85",
+    "dbuser": "ops$brdb",
+    "dbport": "1529",
+    "pass": "brdb",
+    "dbname": "BRDB",
     "sslmode":"require"
 }
